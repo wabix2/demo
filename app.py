@@ -7,17 +7,10 @@ import os
 import datetime
 import difflib
 import sqlite3
-import traceback
-import sys
 from deep_translator import GoogleTranslator
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
-
-# ---------------- Logging ----------------
-import logging
-logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
-logger = logging.getLogger(__name__)
 
 # ---------------- Flask-Login Setup ----------------
 login_manager = LoginManager()
@@ -25,11 +18,10 @@ login_manager.init_app(app)
 login_manager.login_view = 'login'
 login_manager.login_message = "Please log in to access AfriVoice AI."
 
-# ---------------- Database Setup (using /tmp for Render) ----------------
-DATABASE = os.environ.get('DATABASE_PATH', '/tmp/afrivoice.db')
+# ---------------- Database Setup (Render compatible) ----------------
+DATABASE = '/tmp/afrivoice.db'
 
 def init_db():
-    os.makedirs(os.path.dirname(DATABASE), exist_ok=True)
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users (
@@ -55,7 +47,6 @@ def init_db():
     )''')
     conn.commit()
     conn.close()
-    logger.info("Database initialized at %s", DATABASE)
 
 def get_db():
     conn = sqlite3.connect(DATABASE)
@@ -102,13 +93,8 @@ def flatten_knowledge_base(raw):
         flat = raw
     return flat
 
-try:
-    kb_raw = load_json("knowledge_base.json")
-    kb = flatten_knowledge_base(kb_raw)
-    logger.info("Knowledge base loaded with %d topics", len(kb))
-except Exception as e:
-    logger.error("Failed to load knowledge base: %s", e)
-    kb = {}
+kb_raw = load_json("knowledge_base.json")
+kb = flatten_knowledge_base(kb_raw)
 
 # ---------------- Language Detection ----------------
 def detect_lang(text):
@@ -131,8 +117,7 @@ def translate_to_english(text):
         src = 'am' if detect_lang(text) == 'am' else 'om' if detect_lang(text) == 'om' else 'auto'
         translated = GoogleTranslator(source=src, target='en').translate(text)
         return translated, src if src != 'auto' else 'en'
-    except Exception as e:
-        logger.warning("Translation to English failed: %s", e)
+    except:
         return text, 'en'
 
 def translate_from_english(text, target_lang):
@@ -140,11 +125,10 @@ def translate_from_english(text, target_lang):
         return text
     try:
         return GoogleTranslator(source='en', target=target_lang).translate(text)
-    except Exception as e:
-        logger.warning("Translation from English failed: %s", e)
+    except:
         return text
 
-# ---------------- Smart Topic Matching ----------------
+# ---------------- Topic Matching ----------------
 def find_best_topic(query):
     query_lower = query.lower()
     query_words = set(query_lower.split())
@@ -183,15 +167,12 @@ def set_user_context(user_id, topic):
 
 # ---------------- Save Conversation ----------------
 def save_conversation(user_id, message, response):
-    try:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("INSERT INTO conversations (user_id, message, response) VALUES (?, ?, ?)",
-                  (user_id, message, response))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error("Failed to save conversation: %s", e)
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("INSERT INTO conversations (user_id, message, response) VALUES (?, ?, ?)",
+              (user_id, message, response))
+    conn.commit()
+    conn.close()
 
 def get_recent_conversations(user_id, limit=10):
     conn = get_db()
@@ -204,10 +185,7 @@ def get_recent_conversations(user_id, limit=10):
 
 # ---------------- Response Generation ----------------
 def generate_response(query, user_id=None):
-    try:
-        english_query, original_lang = translate_to_english(query)
-    except:
-        english_query, original_lang = query, 'en'
+    english_query, original_lang = translate_to_english(query)
     
     follow_up_phrases = ["more", "tell me more", "what else", "another", "any other", "ሌላ", "ተጨማሪ", "kan biraa"]
     is_follow_up = any(phrase in query.lower() for phrase in follow_up_phrases)
@@ -275,9 +253,6 @@ def signup():
             return redirect(url_for('login'))
         except sqlite3.IntegrityError:
             flash('Username or email already exists.', 'danger')
-        except Exception as e:
-            logger.error("Signup error: %s", e)
-            flash('An error occurred. Please try again.', 'danger')
         conn.close()
     return render_template_string(SIGNUP_PAGE_HTML)
 
@@ -319,29 +294,251 @@ def history():
     conversations = get_recent_conversations(current_user.id, 20)
     return jsonify(conversations)
 
-# ---------------- UI Templates (same as before, omitted for brevity) ----------------
-# (Include the full HTML templates from the previous answer)
+# ---------------- UI Templates ----------------
+LOGIN_PAGE_HTML = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Login - AfriVoice AI</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gradient-to-br from-emerald-50 via-teal-50 to-green-100 min-h-screen flex items-center justify-center">
+  <div class="max-w-md w-full mx-4">
+    <div class="bg-white rounded-2xl shadow-xl p-8">
+      <div class="text-center mb-6">
+        <div class="bg-emerald-700 w-16 h-16 mx-auto rounded-xl flex items-center justify-center shadow-lg">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+          </svg>
+        </div>
+        <h2 class="mt-4 text-2xl font-bold text-gray-800">Welcome Back</h2>
+        <p class="text-gray-500">Sign in to AfriVoice AI</p>
+      </div>
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          {% for category, message in messages %}
+            <div class="mb-4 p-3 rounded-lg {% if category == 'success' %}bg-green-100 text-green-700{% else %}bg-red-100 text-red-700{% endif %}">
+              {{ message }}
+            </div>
+          {% endfor %}
+        {% endif %}
+      {% endwith %}
+      <form method="POST" class="space-y-5">
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Username or Email</label>
+          <input type="text" name="username" required class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent">
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Password</label>
+          <input type="password" name="password" required class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent">
+        </div>
+        <button type="submit" class="w-full bg-emerald-700 text-white py-3 rounded-lg font-semibold hover:bg-emerald-800 transition shadow-md">Sign In</button>
+      </form>
+      <p class="mt-6 text-center text-gray-600">Don't have an account? <a href="/signup" class="text-emerald-700 font-medium hover:underline">Create one</a></p>
+    </div>
+  </div>
+</body>
+</html>
+'''
 
-LOGIN_PAGE_HTML = ''' ... '''  # Use the same templates as before
-SIGNUP_PAGE_HTML = ''' ... '''
-MAIN_PAGE_HTML = ''' ... '''
+SIGNUP_PAGE_HTML = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign Up - AfriVoice AI</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gradient-to-br from-emerald-50 via-teal-50 to-green-100 min-h-screen flex items-center justify-center">
+  <div class="max-w-md w-full mx-4">
+    <div class="bg-white rounded-2xl shadow-xl p-8">
+      <div class="text-center mb-6">
+        <div class="bg-emerald-700 w-16 h-16 mx-auto rounded-xl flex items-center justify-center shadow-lg">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+          </svg>
+        </div>
+        <h2 class="mt-4 text-2xl font-bold text-gray-800">Create Account</h2>
+        <p class="text-gray-500">Join AfriVoice AI today</p>
+      </div>
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          {% for category, message in messages %}
+            <div class="mb-4 p-3 rounded-lg {% if category == 'success' %}bg-green-100 text-green-700{% else %}bg-red-100 text-red-700{% endif %}">
+              {{ message }}
+            </div>
+          {% endfor %}
+        {% endif %}
+      {% endwith %}
+      <form method="POST" class="space-y-4">
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Full Name</label>
+          <input type="text" name="full_name" required class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent">
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Username</label>
+          <input type="text" name="username" required class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent">
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Email</label>
+          <input type="email" name="email" required class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent">
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Password</label>
+          <input type="password" name="password" required class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent">
+        </div>
+        <button type="submit" class="w-full bg-emerald-700 text-white py-3 rounded-lg font-semibold hover:bg-emerald-800 transition shadow-md">Sign Up</button>
+      </form>
+      <p class="mt-6 text-center text-gray-600">Already have an account? <a href="/login" class="text-emerald-700 font-medium hover:underline">Sign in</a></p>
+    </div>
+  </div>
+</body>
+</html>
+'''
 
-# ---------------- Error Handlers ----------------
-@app.errorhandler(500)
-def internal_error(e):
-    logger.error("Internal Server Error: %s", traceback.format_exc())
-    return "Internal Server Error. Please check logs or try again later.", 500
+MAIN_PAGE_HTML = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AfriVoice AI - Your Personal Assistant</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .typing::after { content: '▋'; animation: blink 1s infinite; }
+    @keyframes blink { 50% { opacity: 0; } }
+  </style>
+</head>
+<body class="bg-gradient-to-b from-emerald-50 to-teal-100 min-h-screen flex">
+  <div class="w-80 bg-white/90 backdrop-blur-sm border-r border-emerald-200 p-4 flex-col hidden md:flex">
+    <div class="flex items-center gap-3 mb-6">
+      <div class="bg-emerald-700 p-2 rounded-xl shadow-md">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+        </svg>
+      </div>
+      <div>
+        <h2 class="text-lg font-bold text-gray-800">AfriVoice AI</h2>
+        <p class="text-xs text-emerald-700">{{ current_user.full_name or current_user.username }}</p>
+      </div>
+    </div>
+    <div class="flex-1 overflow-y-auto">
+      <h3 class="text-sm font-semibold text-gray-500 mb-2">Recent Conversations</h3>
+      <div id="history-list" class="space-y-1"></div>
+    </div>
+    <div class="pt-4 border-t border-gray-200">
+      <a href="/logout" class="flex items-center gap-2 text-gray-600 hover:text-emerald-700 transition">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+        </svg>
+        <span>Logout</span>
+      </a>
+    </div>
+  </div>
 
-@app.errorhandler(Exception)
-def unhandled_exception(e):
-    logger.error("Unhandled Exception: %s", traceback.format_exc())
-    return "Internal Server Error. Please check logs.", 500
+  <div class="flex-1 flex flex-col">
+    <header class="bg-white/80 backdrop-blur-sm p-4 border-b border-emerald-200">
+      <h1 class="text-xl font-semibold text-gray-800">AfriVoice AI <span class="text-xs bg-emerald-100 text-emerald-800 px-2 py-1 rounded-full ml-2">Your Personal Assistant</span></h1>
+    </header>
+
+    <div id="chat-box" class="flex-1 overflow-y-auto p-4 space-y-3">
+      <div class="flex justify-start">
+        <div class="bg-emerald-100 text-emerald-900 px-4 py-2 rounded-2xl rounded-bl-none max-w-[80%]">
+          👋 Hello {{ current_user.full_name or current_user.username }}! I'm AfriVoice AI, your personal assistant. Ask me anything about farming, health, or education in English, Amharic, or Afaan Oromo.
+        </div>
+      </div>
+    </div>
+
+    <form id="chat-form" class="p-4 border-t border-emerald-200 bg-white/50 backdrop-blur-sm">
+      <div class="flex gap-2">
+        <input type="text" id="message" placeholder="Type your question..." 
+               class="flex-1 border border-emerald-300 rounded-full px-5 py-3 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent shadow-sm">
+        <button type="submit" class="bg-emerald-700 text-white px-6 py-3 rounded-full hover:bg-emerald-800 transition shadow-md font-medium">Send</button>
+      </div>
+      <p class="text-xs text-gray-500 mt-2 text-center">Supports Amharic · Afaan Oromo · English · Remembers context</p>
+    </form>
+  </div>
+
+  <script>
+    const box = document.getElementById('chat-box');
+    const form = document.getElementById('chat-form');
+    const input = document.getElementById('message');
+
+    function addMessage(text, sender) {
+      const wrapper = document.createElement('div');
+      wrapper.className = `flex ${sender === 'user' ? 'justify-end' : 'justify-start'}`;
+      const bubble = document.createElement('div');
+      bubble.className = `px-4 py-2 rounded-2xl max-w-[80%] shadow-sm ${
+        sender === 'user' 
+          ? 'bg-emerald-600 text-white rounded-br-none' 
+          : 'bg-white text-gray-800 border border-gray-200 rounded-bl-none'
+      }`;
+      bubble.textContent = text;
+      wrapper.appendChild(bubble);
+      box.appendChild(wrapper);
+      box.scrollTop = box.scrollHeight;
+    }
+
+    async function loadHistory() {
+      try {
+        const res = await fetch('/history');
+        const data = await res.json();
+        const list = document.getElementById('history-list');
+        if(list){
+          list.innerHTML = '';
+          data.slice(0, 10).forEach(item => {
+            const div = document.createElement('div');
+            div.className = 'p-2 hover:bg-gray-100 rounded-lg cursor-pointer text-sm truncate';
+            div.textContent = item.message;
+            div.onclick = () => input.value = item.message;
+            list.appendChild(div);
+          });
+        }
+      } catch(e) {}
+    }
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const msg = input.value.trim();
+      if (!msg) return;
+      
+      addMessage(msg, 'user');
+      input.value = '';
+      
+      const typingDiv = document.createElement('div');
+      typingDiv.className = 'flex justify-start';
+      typingDiv.innerHTML = '<div class="bg-gray-200 text-gray-600 px-4 py-2 rounded-2xl rounded-bl-none typing">Thinking...</div>';
+      box.appendChild(typingDiv);
+      box.scrollTop = box.scrollHeight;
+
+      try {
+        const res = await fetch('/chat', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({message: msg})
+        });
+        const data = await res.json();
+        typingDiv.remove();
+        addMessage(data.response, 'bot');
+        loadHistory();
+      } catch (err) {
+        typingDiv.remove();
+        addMessage('Error: Could not reach server.', 'bot');
+      }
+    });
+
+    loadHistory();
+  </script>
+</body>
+</html>
+'''
 
 # ---------------- Initialize and Run ----------------
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
-else:
-    # For gunicorn
-    init_db()
+    
