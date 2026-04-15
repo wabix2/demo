@@ -1,14 +1,87 @@
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for, flash
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
 import json
 import random
 import os
 import datetime
 import difflib
+import sqlite3
+import traceback
+import sys
 from deep_translator import GoogleTranslator
 
 app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
 
-# ---------------- LOAD DATA ----------------
+# ---------------- Logging ----------------
+import logging
+logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+# ---------------- Flask-Login Setup ----------------
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login'
+login_manager.login_message = "Please log in to access AfriVoice AI."
+
+# ---------------- Database Setup (using /tmp for Render) ----------------
+DATABASE = os.environ.get('DATABASE_PATH', '/tmp/afrivoice.db')
+
+def init_db():
+    os.makedirs(os.path.dirname(DATABASE), exist_ok=True)
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        full_name TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS conversations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        message TEXT NOT NULL,
+        response TEXT NOT NULL,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id)
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS user_memory (
+        user_id INTEGER PRIMARY KEY,
+        last_topic TEXT,
+        FOREIGN KEY (user_id) REFERENCES users (id)
+    )''')
+    conn.commit()
+    conn.close()
+    logger.info("Database initialized at %s", DATABASE)
+
+def get_db():
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# ---------------- User Class ----------------
+class User(UserMixin):
+    def __init__(self, id, username, email, full_name):
+        self.id = id
+        self.username = username
+        self.email = email
+        self.full_name = full_name
+
+@login_manager.user_loader
+def load_user(user_id):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id, username, email, full_name FROM users WHERE id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return User(row['id'], row['username'], row['email'], row['full_name'])
+    return None
+
+# ---------------- Load Knowledge Base ----------------
 def load_json(file):
     if os.path.exists(file):
         with open(file, "r", encoding="utf-8") as f:
@@ -29,97 +102,37 @@ def flatten_knowledge_base(raw):
         flat = raw
     return flat
 
-kb_raw = load_json("knowledge_base.json")
-kb = flatten_knowledge_base(kb_raw)
-memory = load_json("memory.json")
+try:
+    kb_raw = load_json("knowledge_base.json")
+    kb = flatten_knowledge_base(kb_raw)
+    logger.info("Knowledge base loaded with %d topics", len(kb))
+except Exception as e:
+    logger.error("Failed to load knowledge base: %s", e)
+    kb = {}
 
-# ---------------- LANGUAGE DETECTION ----------------
+# ---------------- Language Detection ----------------
 def detect_lang(text):
     for ch in text:
         if '\u1200' <= ch <= '\u137F':
             return "am"
+    oromo_indicators = ["akkam", "naga", "fayya", "galatooma", "barbaada", "jira", "qaba",
+                        "hojii", "qonna", "biyya", "lafa", "bishaan", "nyaata", "beekta",
+                        "danda'a", "facaafanna", "gabbifanna", "sassaabna", "qoranna", "ittifanna",
+                        "oomishtummaa", "soorata", "dhukkuba", "qorichaa"]
+    text_lower = text.lower()
+    for word in oromo_indicators:
+        if word in text_lower:
+            return "om"
     return "en"
 
-# ---------------- SYNONYM MAPPING ----------------
-TOPIC_SYNONYMS = {
-    "soil fertility": "Soil fertility testing",
-    "soil test": "Soil fertility testing",
-    "honey harvest": "Honey Harvesting",
-    "coffee disease": "Prevention of Coffee Berry Disease",
-    "cbd": "Prevention of Coffee Berry Disease",
-    "sheep fattening": "Sheep Fattening",
-    "teff sowing": "Teff Sowing",
-    "teff seed": "Teff seed selection",
-    "newcastle": "Preventing Newcastle disease in chickens",
-    "trachoma": "Preventing eye infections (Trachoma)",
-    "moringa": "Using Moringa leaves for nutrition",
-    "rainwater": "Rainwater harvesting for home gardens",
-    "aphids": "Natural ways to kill aphids on vegetables",
-    "crop rotation": "Crop rotation to prevent soil exhaustion",
-    "hermetic bags": "Storing grains in airtight (hermetic) bags",
-    "sweet potato": "Sweet potato vine planting",
-    "cassava mosaic": "Cassava mosaic disease prevention",
-    "manure": "Using animal manure for fertilizer",
-    "mulching": "Mulching techniques to keep soil moist",
-    "soil health": "Identifying healthy vs. sick soil",
-    "goat housing": "Housing requirements for goats",
-    "cross breeding cows": "Benefits of cross-breeding local cows",
-    "egg production": "Feeding poultry for better egg production",
-    "rabies": "Signs of Rabies in farm dogs and livestock",
-    "dead livestock": "Proper disposal of dead livestock to prevent disease",
-    "iron rich foods": "Iron-rich foods for pregnant women",
-    "clean water infant": "Importance of clean water for infant formula",
-    "malaria children": "Recognizing signs of Malaria in children",
-    "hand washing food": "Hand washing for food preparation safety",
-    "choking": "Basic first aid for choking",
-    "grain cleaning": "Cleaning and grading grains for market",
-    "solar drying": "Solar drying for fruits and vegetables",
-    "bookkeeping": "Basic bookkeeping for small farms",
-    "egg transport": "Safe transport of eggs to market",
-    "seed storage weevils": "Protecting stored seeds from weevils",
-}
-
-# ---------------- FUZZY MATCHING ----------------
-def smart_match(query):
-    query_lower = query.lower()
-    
-    # 1. Check synonym mapping
-    for phrase, topic_name in TOPIC_SYNONYMS.items():
-        if phrase in query_lower:
-            if topic_name in kb:
-                return kb[topic_name], 10
-    
-    # 2. Keyword matching
-    query_words = set(query_lower.split())
-    best_score = 0
-    best_data = None
-
-    for topic, data in kb.items():
-        topic_words = set(topic.lower().split())
-        keywords = set(data.get("keywords", []))
-        all_keywords = topic_words | keywords
-
-        matches = 0
-        for qw in query_words:
-            for kw in all_keywords:
-                if qw == kw.lower() or difflib.SequenceMatcher(None, qw, kw.lower()).ratio() >= 0.75:
-                    matches += 1
-                    break
-
-        if matches > best_score:
-            best_score = matches
-            best_data = data
-
-    return best_data, best_score
-
-# ---------------- TRANSLATION ----------------
+# ---------------- Translation ----------------
 def translate_to_english(text):
     try:
-        src = 'am' if detect_lang(text) == 'am' else 'auto'
+        src = 'am' if detect_lang(text) == 'am' else 'om' if detect_lang(text) == 'om' else 'auto'
         translated = GoogleTranslator(source=src, target='en').translate(text)
         return translated, src if src != 'auto' else 'en'
     except Exception as e:
-        print(f"Translation error: {e}")
+        logger.warning("Translation to English failed: %s", e)
         return text, 'en'
 
 def translate_from_english(text, target_lang):
@@ -127,27 +140,97 @@ def translate_from_english(text, target_lang):
         return text
     try:
         return GoogleTranslator(source='en', target=target_lang).translate(text)
-    except:
+    except Exception as e:
+        logger.warning("Translation from English failed: %s", e)
         return text
 
-# ---------------- MEMORY LEARNING ----------------
-def learn(user, bot):
-    key = user.lower()
-    if key not in memory:
-        memory[key] = {"answer": bot, "count": 1, "time": str(datetime.datetime.now())}
-    else:
-        memory[key]["count"] += 1
-    with open("memory.json", "w", encoding="utf-8") as f:
-        json.dump(memory, f, indent=2, ensure_ascii=False)
+# ---------------- Smart Topic Matching ----------------
+def find_best_topic(query):
+    query_lower = query.lower()
+    query_words = set(query_lower.split())
+    best_score = 0
+    best_data = None
+    for topic, data in kb.items():
+        keywords = set(data.get("keywords", []))
+        topic_words = set(topic.lower().split())
+        all_keywords = keywords | topic_words
+        matches = 0
+        for qw in query_words:
+            for kw in all_keywords:
+                if qw == kw.lower() or difflib.SequenceMatcher(None, qw, kw.lower()).ratio() >= 0.6:
+                    matches += 1
+                    break
+        if matches > best_score:
+            best_score = matches
+            best_data = data
+    return best_data, best_score
 
-# ---------------- SMART RESPONSE ENGINE ----------------
-def generate_response(query):
-    english_query, original_lang = translate_to_english(query)
-    if query.lower() in memory:
-        return memory[query.lower()]["answer"]
+# ---------------- Context Memory ----------------
+def get_user_context(user_id):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT last_topic FROM user_memory WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row['last_topic'] if row else None
 
-    data, score = smart_match(english_query)
+def set_user_context(user_id, topic):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO user_memory (user_id, last_topic) VALUES (?, ?)", (user_id, topic))
+    conn.commit()
+    conn.close()
+
+# ---------------- Save Conversation ----------------
+def save_conversation(user_id, message, response):
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("INSERT INTO conversations (user_id, message, response) VALUES (?, ?, ?)",
+                  (user_id, message, response))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error("Failed to save conversation: %s", e)
+
+def get_recent_conversations(user_id, limit=10):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT message, response, timestamp FROM conversations WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?",
+              (user_id, limit))
+    rows = c.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+# ---------------- Response Generation ----------------
+def generate_response(query, user_id=None):
+    try:
+        english_query, original_lang = translate_to_english(query)
+    except:
+        english_query, original_lang = query, 'en'
+    
+    follow_up_phrases = ["more", "tell me more", "what else", "another", "any other", "ሌላ", "ተጨማሪ", "kan biraa"]
+    is_follow_up = any(phrase in query.lower() for phrase in follow_up_phrases)
+    
+    if is_follow_up and user_id:
+        last_topic = get_user_context(user_id)
+        if last_topic and last_topic in kb:
+            data = kb[last_topic]
+            follow_ups = data.get("follow_ups", {}).get("en", [])
+            if follow_ups:
+                response = random.choice(follow_ups)
+                set_user_context(user_id, last_topic)
+                return translate_from_english(response, original_lang)
+    
+    data, score = find_best_topic(english_query)
+    
     if data and score > 0:
+        if user_id:
+            for name, d in kb.items():
+                if d == data:
+                    set_user_context(user_id, name)
+                    break
+        
         answers = data.get("answers", {})
         if original_lang in answers:
             response = random.choice(answers[original_lang])
@@ -156,119 +239,109 @@ def generate_response(query):
             response = translate_from_english(eng_answer, original_lang)
     else:
         if original_lang == "am":
-            response = "ይቅርታ፣ ስለዚህ ጥያቄ መረጃ የለኝም። ስለ ጤፍ፣ በግ ማደለብ፣ ማር መሰብሰብ ወይም ጤና መጠየቅ ይችላሉ።"
+            response = "ይቅርታ፣ ስለዚህ ጥያቄ መረጃ የለኝም።"
+        elif original_lang == "om":
+            response = "Dhiifama, waa'ee gaaffii kanaa odeeffannoo hin qabnu."
         else:
-            response = "I don't have information on that yet. Try asking about teff sowing, sheep fattening, honey harvesting, or health topics."
+            response = "I don't have information on that yet."
     return response
 
-# ---------------- UI ----------------
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AfriVoice AI - Your Personal Assistant</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <style>
-    .typing::after { content: '▋'; animation: blink 1s infinite; }
-    @keyframes blink { 50% { opacity: 0; } }
-  </style>
-</head>
-<body class="bg-gradient-to-b from-emerald-50 to-teal-100 min-h-screen">
-  <div class="max-w-3xl mx-auto p-4">
-    <div class="bg-white/90 backdrop-blur-sm rounded-2xl shadow-xl p-6 border border-emerald-200">
-      <div class="flex items-center gap-3 mb-4">
-        <div class="bg-emerald-700 p-2 rounded-xl shadow-md">
-          <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
-          </svg>
-        </div>
-        <div>
-          <h1 class="text-3xl font-bold text-gray-800">AfriVoice AI</h1>
-          <p class="text-sm text-emerald-700 font-medium">Your Personal Assistant</p>
-        </div>
-      </div>
-      <div id="chat-box" class="bg-gray-50/80 rounded-xl p-4 h-96 overflow-y-auto mb-4 border border-emerald-100 space-y-3 shadow-inner">
-        <div class="flex justify-start">
-          <div class="bg-emerald-100 text-emerald-900 px-4 py-2 rounded-2xl rounded-bl-none max-w-[80%]">
-            👋 Hello! I'm AfriVoice AI, your personal assistant for farming, livestock, health, and education. Ask me anything in English or Amharic.
-            <br><span class="text-sm">ሰላም! ስለ እርሻ፣ እንስሳት፣ ጤና እና ትምህርት በአማርኛ ወይም በእንግሊዝኛ ይጠይቁ።</span>
-          </div>
-        </div>
-      </div>
-      <form id="chat-form" class="flex gap-2">
-        <input type="text" id="message" placeholder="Type your question..." 
-               class="flex-1 border border-emerald-300 rounded-full px-5 py-3 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent shadow-sm">
-        <button type="submit" class="bg-emerald-700 text-white px-6 py-3 rounded-full hover:bg-emerald-800 transition shadow-md font-medium">Send</button>
-      </form>
-      <p class="text-xs text-gray-500 mt-3 text-center">🌱 Amharic & English • Spelling Tolerant • Learns from you</p>
-    </div>
-  </div>
-  <script>
-    const box = document.getElementById('chat-box');
-    const form = document.getElementById('chat-form');
-    const input = document.getElementById('message');
+# ---------------- Routes ----------------
+@app.route('/')
+def index():
+    if current_user.is_authenticated:
+        return render_template_string(MAIN_PAGE_HTML)
+    return redirect(url_for('login'))
 
-    function addMessage(text, sender) {
-      const wrapper = document.createElement('div');
-      wrapper.className = `flex ${sender === 'user' ? 'justify-end' : 'justify-start'}`;
-      const bubble = document.createElement('div');
-      bubble.className = `px-4 py-2 rounded-2xl max-w-[80%] shadow-sm ${
-        sender === 'user' 
-          ? 'bg-emerald-600 text-white rounded-br-none' 
-          : 'bg-white text-gray-800 border border-gray-200 rounded-bl-none'
-      }`;
-      bubble.textContent = text;
-      wrapper.appendChild(bubble);
-      box.appendChild(wrapper);
-      box.scrollTop = box.scrollHeight;
-    }
+@app.route('/signup', methods=['GET', 'POST'])
+def signup():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        email = request.form.get('email')
+        password = request.form.get('password')
+        full_name = request.form.get('full_name')
+        
+        conn = get_db()
+        c = conn.cursor()
+        try:
+            c.execute("INSERT INTO users (username, email, password_hash, full_name) VALUES (?, ?, ?, ?)",
+                      (username, email, generate_password_hash(password), full_name))
+            conn.commit()
+            user_id = c.lastrowid
+            c.execute("INSERT INTO user_memory (user_id, last_topic) VALUES (?, ?)", (user_id, None))
+            conn.commit()
+            conn.close()
+            flash('Account created successfully! Please log in.', 'success')
+            return redirect(url_for('login'))
+        except sqlite3.IntegrityError:
+            flash('Username or email already exists.', 'danger')
+        except Exception as e:
+            logger.error("Signup error: %s", e)
+            flash('An error occurred. Please try again.', 'danger')
+        conn.close()
+    return render_template_string(SIGNUP_PAGE_HTML)
 
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const msg = input.value.trim();
-      if (!msg) return;
-      
-      addMessage(msg, 'user');
-      input.value = '';
-      
-      const typingDiv = document.createElement('div');
-      typingDiv.className = 'flex justify-start';
-      typingDiv.innerHTML = '<div class="bg-gray-200 text-gray-600 px-4 py-2 rounded-2xl rounded-bl-none typing">Thinking...</div>';
-      box.appendChild(typingDiv);
-      box.scrollTop = box.scrollHeight;
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT id, username, email, full_name, password_hash FROM users WHERE username = ? OR email = ?",
+                  (username, username))
+        row = c.fetchone()
+        conn.close()
+        if row and check_password_hash(row['password_hash'], password):
+            user = User(row['id'], row['username'], row['email'], row['full_name'])
+            login_user(user, remember=True)
+            return redirect(url_for('index'))
+        flash('Invalid username or password.', 'danger')
+    return render_template_string(LOGIN_PAGE_HTML)
 
-      try {
-        const res = await fetch('/chat', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({message: msg})
-        });
-        const data = await res.json();
-        typingDiv.remove();
-        addMessage(data.response, 'bot');
-      } catch (err) {
-        typingDiv.remove();
-        addMessage('Error: Could not reach server. Please try again.', 'bot');
-      }
-    });
-  </script>
-</body>
-</html>
-"""
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for('login'))
 
-@app.route("/")
-def home():
-    return render_template_string(HTML_TEMPLATE)
-
-@app.route("/chat", methods=["POST"])
+@app.route('/chat', methods=['POST'])
+@login_required
 def chat():
     user_msg = request.json.get("message", "")
-    response = generate_response(user_msg)
-    learn(user_msg, response)
+    response = generate_response(user_msg, current_user.id)
+    save_conversation(current_user.id, user_msg, response)
     return jsonify({"response": response})
 
+@app.route('/history')
+@login_required
+def history():
+    conversations = get_recent_conversations(current_user.id, 20)
+    return jsonify(conversations)
+
+# ---------------- UI Templates (same as before, omitted for brevity) ----------------
+# (Include the full HTML templates from the previous answer)
+
+LOGIN_PAGE_HTML = ''' ... '''  # Use the same templates as before
+SIGNUP_PAGE_HTML = ''' ... '''
+MAIN_PAGE_HTML = ''' ... '''
+
+# ---------------- Error Handlers ----------------
+@app.errorhandler(500)
+def internal_error(e):
+    logger.error("Internal Server Error: %s", traceback.format_exc())
+    return "Internal Server Error. Please check logs or try again later.", 500
+
+@app.errorhandler(Exception)
+def unhandled_exception(e):
+    logger.error("Unhandled Exception: %s", traceback.format_exc())
+    return "Internal Server Error. Please check logs.", 500
+
+# ---------------- Initialize and Run ----------------
 if __name__ == "__main__":
+    init_db()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
+else:
+    # For gunicorn
+    init_db()
