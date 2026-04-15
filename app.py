@@ -7,6 +7,8 @@ import os
 import datetime
 import difflib
 import sqlite3
+import sys
+import traceback
 from deep_translator import GoogleTranslator
 
 app = Flask(__name__)
@@ -117,7 +119,8 @@ def translate_to_english(text):
         src = 'am' if detect_lang(text) == 'am' else 'om' if detect_lang(text) == 'om' else 'auto'
         translated = GoogleTranslator(source=src, target='en').translate(text)
         return translated, src if src != 'auto' else 'en'
-    except:
+    except Exception as e:
+        print(f"ERROR in translate_to_english: {e}", file=sys.stderr)
         return text, 'en'
 
 def translate_from_english(text, target_lang):
@@ -536,9 +539,15 @@ MAIN_PAGE_HTML = '''
 </html>
 '''
 
-# ---------------- Initialize and Run ----------------
-if __name__ == "__main__":
+# ---------------- Initialize Database at Module Level ----------------
+print("Starting AfriVoice AI...", file=sys.stderr)
+try:
     init_db()
+    print("Database initialized successfully.", file=sys.stderr)
+except Exception as e:
+    print(f"Database init error: {e}", file=sys.stderr)
+    traceback.print_exc()
+
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
-    
